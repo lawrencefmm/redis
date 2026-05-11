@@ -1,54 +1,82 @@
 mod redisdb;
 
 use redisdb::Redisdb;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{Shutdown, SocketAddr};
 use std::str;
+use std::time::Duration;
 
-enum Status {
-    Continue,
-    End,
+use mio::net::{TcpListener, TcpStream};
+use mio::{Events, Interest, Poll, Token};
+
+struct Conn {
+    pub stream: TcpStream,
+    pub want_read: bool,
+    pub want_write: bool,
+    pub want_close: bool,
+    pub incoming_buf: Vec<u8>,
+    pub outgoing_buf: Vec<u8>,
 }
 
-fn handle_client(
-    redis: &mut Redisdb,
-    buffer: &mut BufReader<&TcpStream>,
-    mut stream: &TcpStream,
-) -> std::io::Result<Status> {
-    let mut msg_size_buf: [u8; 4] = [0; 4];
-    if buffer.fill_buf()?.is_empty() {
-        return Ok(Status::End);
+impl Conn {
+    fn new(stream: TcpStream) -> Conn {
+        Conn {
+            stream: stream,
+            want_read: true,
+            want_write: false,
+            want_close: false,
+            incoming_buf: Vec::new(),
+            outgoing_buf: Vec::new(),
+        }
     }
-    buffer.read_exact(&mut msg_size_buf)?;
+}
 
-    let msg_size = u32::from_be_bytes(msg_size_buf) as usize;
+fn try_one_req(conn: &mut Conn, redis: &mut Redisdb) -> bool {
+    if conn.incoming_buf.len() < 4 {
+        return false;
+    }
+
+    let msg_size = u32::from_be_bytes(conn.incoming_buf[0..4].try_into().unwrap()) as usize;
+
+    if 4 + msg_size > conn.incoming_buf.len() {
+        return false;
+    }
 
     if msg_size <= 0 {
-        return Ok(Status::End);
+        conn.want_close = true;
+        return false;
     }
-    let mut msg_buf: Vec<u8> = vec![0; msg_size];
 
-    buffer.read_exact(&mut msg_buf)?;
+    let msg = &conn.incoming_buf[4..];
 
-    let key_size = u32::from_be_bytes(msg_buf[0..4].try_into().unwrap()) as usize;
+    let key_size = u32::from_be_bytes(msg[0..4].try_into().unwrap()) as usize;
     println!("key_size: {key_size}");
-    let key_bytes = &msg_buf[4..(4 + key_size)];
+    let key_bytes = &msg[4..(4 + key_size)];
     let key = str::from_utf8(key_bytes).unwrap();
 
     let data_size =
-        u32::from_be_bytes(msg_buf[(4 + key_size)..(8 + key_size)].try_into().unwrap()) as usize;
-    let data_bytes = &msg_buf[(8 + key_size)..(8 + key_size + data_size)];
+        u32::from_be_bytes(msg[(4 + key_size)..(8 + key_size)].try_into().unwrap()) as usize;
+
+    let data_bytes = &msg[(8 + key_size)..(8 + key_size + data_size)];
     let mut data: Vec<u8> = Vec::new();
+
     data.extend_from_slice(data_bytes);
 
     match redis.insert(&key, data) {
         false => {
-            stream.write_all("key created in redis".as_bytes())?;
+            conn.outgoing_buf.extend_from_slice(&u32::to_be_bytes(20));
+            conn.outgoing_buf
+                .extend_from_slice("key created in redis".as_bytes());
         }
         true => {
-            stream.write_all("key updated in redis".as_bytes())?;
+            conn.outgoing_buf.extend_from_slice(&u32::to_be_bytes(20));
+
+            conn.outgoing_buf
+                .extend_from_slice("key updated in redis".as_bytes());
         }
     }
+
     let ans = redis.get(&key).unwrap();
     print!("key: {key}, value: ");
     for (_i, &val) in ans.iter().enumerate() {
@@ -56,40 +84,109 @@ fn handle_client(
     }
     println!("");
 
-    Ok(Status::Continue)
+    conn.incoming_buf.drain(..(4 + msg_size));
+    return true;
+}
+
+fn handle_read(conn: &mut Conn, redis: &mut Redisdb) {
+    let mut buf: [u8; 65536] = [0; 65536];
+    assert!(conn.want_read);
+
+    match conn.stream.read(&mut buf) {
+        Ok(0) => {
+            conn.want_close = true;
+            return;
+        }
+        Ok(n) => {
+            conn.incoming_buf.extend_from_slice(&buf[..n]);
+            while try_one_req(conn, redis) {}
+            if conn.outgoing_buf.len() > 0 {
+                conn.want_read = false;
+                conn.want_write = true;
+            }
+        }
+        Err(e) => {
+            eprintln!("Error reading {e}");
+            conn.want_close = true;
+            return;
+        }
+    }
+}
+
+fn handle_write(conn: &mut Conn) {
+    assert!(conn.outgoing_buf.len() > 0);
+    assert!(conn.want_write);
+
+    match conn.stream.write(&conn.outgoing_buf) {
+        Ok(n) => {
+            println!("wrote {n} bytes");
+            conn.outgoing_buf.drain(..n);
+            if conn.outgoing_buf.len() == 0 {
+                conn.want_read = true;
+                conn.want_write = false;
+            }
+        }
+        Err(e) => {
+            eprintln!("error writing {e}");
+            conn.want_close = true;
+        }
+    }
 }
 
 fn main() -> std::io::Result<()> {
     let mut redis = Redisdb::new();
 
-    let listener = TcpListener::bind("0.0.0.0:1234")?;
+    let addr: SocketAddr = "0.0.0.0:1234".parse().unwrap();
+    let mut listener = TcpListener::bind(addr)?;
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                println!("hey");
-                let mut reader = BufReader::new(&stream);
-                loop {
-                    match handle_client(&mut redis, &mut reader, &stream) {
-                        Ok(Status::Continue) => {
-                            println!("oii thiagoooo");
-                        }
-                        Ok(Status::End) => {
-                            println!("Ending reads");
-                            break;
-                        }
-                        Err(e) => {
-                            eprintln!("eita {e}");
-                            break;
+    let mut poll = Poll::new()?;
+    let mut events = Events::with_capacity(20);
+
+    let mut token_id = 1;
+    let mut connections: HashMap<Token, Conn> = HashMap::new();
+
+    poll.registry()
+        .register(&mut listener, Token(0), Interest::READABLE)?;
+
+    loop {
+        poll.poll(&mut events, Some(Duration::from_millis(200)))?;
+
+        for event in &events {
+            if event.token() == Token(0) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        poll.registry().register(
+                            &mut stream,
+                            Token(token_id),
+                            Interest::READABLE | Interest::WRITABLE,
+                        )?;
+                        let conn = Conn::new(stream);
+                        connections.insert(Token(token_id), conn);
+
+                        token_id += 1;
+                    }
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::WouldBlock {
+                            return Err(e);
                         }
                     }
                 }
-            }
-            Err(e) => {
-                println!("Error in buffer! {e}");
-                //break;
+            } else {
+                let conn = connections.get_mut(&event.token()).unwrap();
+                if event.is_readable() && conn.want_read {
+                    handle_read(conn, &mut redis);
+                }
+
+                if event.is_writable() && conn.want_write {
+                    handle_write(conn);
+                }
+
+                if conn.want_close {
+                    poll.registry().deregister(&mut conn.stream)?; 
+                    conn.stream.shutdown(Shutdown::Both)?;
+                    connections.remove(&event.token());
+                }
             }
         }
     }
-    Ok(())
 }
